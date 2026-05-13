@@ -21,6 +21,11 @@ Private Const MARGIN_RIGHT_MM As Double = 10
 Private Const FIX_FONT_SIZE As Single = 14         ' если кегль не 13/14 — ставим 14
 Private Const FIX_LINE_SPACING As Single = 1.5     ' множитель для wdLineSpaceMultiple
 
+' Путь к файлу с образцом бланка (левая часть шапки).
+' ОТРЕДАКТИРУЙТЕ под себя или положите blank_template.txt по этому пути.
+' Если файл не найден — проверка бланка пропускается.
+Private Const BLANK_TEMPLATE_PATH As String = "C:\Users\Public\Documents\blank_template.txt"
+
 ' Структура замечания: текст + признак автоисправляемого + код
 Private Type Issue
     Text As String
@@ -249,10 +254,10 @@ Private Sub GatherExecutor(doc As Document, issues() As Issue, ByRef cnt As Long
 End Sub
 
 Private Sub GatherHeader(doc As Document, issues() As Issue, ByRef cnt As Long)
-    ' Собираем «шапочные» параграфы: первые 30 параграфов документа.
+    ' Собираем «шапочные» параграфы: первые 60 параграфов документа.
     ' В Word doc.Paragraphs включает параграфы в ячейках таблиц, так что
     ' табличная шапка тоже попадёт сюда.
-    Const LIMIT As Long = 30
+    Const LIMIT As Long = 60
     Dim topParas As Collection
     Set topParas = New Collection
     Dim i As Long, para As Paragraph
@@ -312,7 +317,7 @@ Private Sub GatherHeader(doc As Document, issues() As Issue, ByRef cnt As Long)
         Dim hasFio As Boolean: hasFio = rx.Test(rightText)
         rx.Pattern = "[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}"
         If Not hasFio Then hasFio = rx.Test(rightText)
-        rx.Pattern = "ООО|АО|ПАО|ОАО|Министерство|Управление|Федеральная|Правительство|Администрация|ФНС|УФНС|ИФНС"
+        rx.Pattern = "ООО|АО|ПАО|ОАО|Министерств|Управлени|Федеральн|Правительств|Администраци|Канцеляри|ФНС|УФНС|ИФНС|Межрегиональн|Инспекци|Департамент|Комитет|Служб"
         Dim hasOrg As Boolean: hasOrg = rx.Test(rightText)
 
         If adresatParas.Count > 0 And Not (hasFio Or hasOrg) Then
@@ -366,35 +371,148 @@ Private Sub GatherHeader(doc As Document, issues() As Issue, ByRef cnt As Long)
         End If
     End If
 
-    ' --- Заголовок «О …»/«Об …» ---
-    Dim startIdx As Long: startIdx = 0
-    If rightParas.Count > 0 Then
-        Dim lastRight As Paragraph
-        Set lastRight = rightParas(rightParas.Count)
-        Dim k As Long: k = 0
-        For Each p In topParas
-            k = k + 1
-            If p Is lastRight Then startIdx = k: Exit For
-        Next p
-    End If
+    ' --- Заголовок «О …»/«Об …» (в пределах всей шапки) ---
     rx.IgnoreCase = False
     rx.Pattern = "^\s*Об?\s+[а-яёА-ЯЁ]"
     Dim titleFound As Boolean
-    k = 0
     For Each p In topParas
-        k = k + 1
-        If k > startIdx Then
-            Dim t2 As String
-            t2 = Trim$(p.Range.Text)
-            If Len(t2) > 0 Then
-                If rx.Test(t2) Then titleFound = True: Exit For
-            End If
+        Dim t2 As String
+        t2 = Trim$(p.Range.Text)
+        If Len(t2) > 0 Then
+            If rx.Test(t2) Then titleFound = True: Exit For
         End If
     Next p
     If Not titleFound Then
-        AddIssue issues, cnt, "Не найден заголовок к тексту «О …»/«Об …» под адресатом (п. 4 Памятки).", False, "TITLE_MISSING"
+        AddIssue issues, cnt, "Не найден заголовок к тексту «О …»/«Об …» в шапке (п. 4 Памятки).", False, "TITLE_MISSING"
     End If
+
+    ' --- Проверка бланка (левая часть шапки) по образцу ---
+    CheckBlank doc, topParas, issues, cnt
 End Sub
+
+Private Sub CheckBlank(doc As Document, topParas As Collection, issues() As Issue, ByRef cnt As Long)
+    ' Читаем образец из файла. Если файла нет — тихо пропускаем.
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(BLANK_TEMPLATE_PATH) Then Exit Sub
+
+    Dim ts As Object
+    On Error GoTo readFail
+    Set ts = fso.OpenTextFile(BLANK_TEMPLATE_PATH, 1, False, -1) ' Unicode
+    Dim content As String
+    content = ts.ReadAll
+    ts.Close
+    On Error GoTo 0
+
+    ' Разбираем строки шаблона
+    Dim items() As String, optFlags() As Boolean, isRegex() As Boolean
+    ReDim items(1 To 100): ReDim optFlags(1 To 100): ReDim isRegex(1 To 100)
+    Dim nItems As Long: nItems = 0
+    Dim lines() As String, ln As Variant, raw As String
+    lines = Split(content, vbCrLf)
+    Dim li As Long
+    For li = LBound(lines) To UBound(lines)
+        raw = lines(li)
+        Dim t As String: t = Trim$(raw)
+        If Len(t) = 0 Then GoTo nextLine
+        If Left$(t, 1) = "#" Then GoTo nextLine
+        Dim optF As Boolean: optF = False
+        Dim rgxF As Boolean: rgxF = False
+        If Left$(t, 1) = "?" Then optF = True: t = LTrim$(Mid$(t, 2))
+        If Left$(t, 3) = "re:" Then rgxF = True: t = Mid$(t, 4)
+        If Len(t) = 0 Then GoTo nextLine
+        nItems = nItems + 1
+        If nItems > UBound(items) Then
+            ReDim Preserve items(1 To nItems + 50)
+            ReDim Preserve optFlags(1 To nItems + 50)
+            ReDim Preserve isRegex(1 To nItems + 50)
+        End If
+        items(nItems) = t
+        optFlags(nItems) = optF
+        isRegex(nItems) = rgxF
+nextLine:
+    Next li
+
+    If nItems = 0 Then Exit Sub
+
+    ' Собираем текст левой части бланка
+    Dim blankText As String
+    blankText = GetBlankText(doc, topParas)
+
+    Dim rx As Object
+    Set rx = CreateObject("VBScript.RegExp")
+    rx.Global = False
+
+    Dim i As Long, found As Boolean
+    For i = 1 To nItems
+        found = False
+        If isRegex(i) Then
+            rx.Pattern = items(i)
+            On Error Resume Next
+            found = rx.Test(blankText)
+            If Err.Number <> 0 Then
+                AddIssue issues, cnt, "Некорректный regexp в blank_template.txt: «" & items(i) & "».", False, "BLANK_BAD_REGEX"
+                Err.Clear
+                On Error GoTo 0
+                GoTo nextItem
+            End If
+            On Error GoTo 0
+        Else
+            found = (InStr(blankText, items(i)) > 0)
+        End If
+        If Not found Then
+            Dim label As String
+            If isRegex(i) Then label = "(regex) " & items(i) Else label = items(i)
+            If optFlags(i) Then
+                AddIssue issues, cnt, "В бланке не найдено (необязательно): «" & label & "».", False, "BLANK_OPTIONAL"
+            Else
+                AddIssue issues, cnt, "В бланке не найдено: «" & label & "».", False, "BLANK_MISSING"
+            End If
+        End If
+nextItem:
+    Next i
+    Exit Sub
+readFail:
+    AddIssue issues, cnt, "Не удалось прочитать blank_template.txt (" & BLANK_TEMPLATE_PATH & ").", False, "BLANK_READ_FAIL"
+End Sub
+
+Private Function GetBlankText(doc As Document, topParas As Collection) As String
+    ' Если в шапке есть таблица — берём левую половину её ячеек.
+    ' Иначе — собираем «нелевые» параграфы из шапки.
+    Dim s As String
+    If doc.Tables.Count > 0 Then
+        Dim t As Table
+        Set t = doc.Tables(1)
+        Dim maxTcs As Long: maxTcs = 0
+        Dim row As row
+        For Each row In t.Rows
+            If row.Cells.Count > maxTcs Then maxTcs = row.Cells.Count
+        Next row
+        Dim half As Long: half = maxTcs \ 2
+        If half < 1 Then half = 1
+        For Each row In t.Rows
+            Dim c As cell
+            Dim cIdx As Long: cIdx = 0
+            For Each c In row.Cells
+                cIdx = cIdx + 1
+                If cIdx > half Then Exit For
+                Dim ctext As String
+                ctext = c.Range.Text
+                ' убираем символ конца ячейки (Chr(13)+Chr(7))
+                ctext = Replace(ctext, Chr(7), "")
+                s = s & ctext & vbLf
+            Next c
+        Next row
+    Else
+        Dim p As Paragraph
+        For Each p In topParas
+            If Not IsRightBlockPara(p) Then
+                If Len(Trim$(p.Range.Text)) > 0 Then s = s & p.Range.Text & vbLf
+            End If
+        Next p
+    End If
+    GetBlankText = s
+End Function
 
 Private Function IsRightBlockPara(p As Paragraph) As Boolean
     IsRightBlockPara = False

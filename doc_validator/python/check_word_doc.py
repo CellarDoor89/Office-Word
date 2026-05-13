@@ -21,7 +21,6 @@ from docx import Document
 from docx.enum.text import WD_LINE_SPACING, WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.shared import Cm, Mm, Pt
-from docx.table import Table
 from docx.text.paragraph import Paragraph
 from lxml import etree
 
@@ -33,7 +32,8 @@ RE_FULL_NAME     = re.compile(r"\b[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,
 RE_FIO_BAD_GLUED = re.compile(r"[А-ЯЁ][а-яё]+[А-ЯЁ]\.")
 RE_FIO_ONE_INIT  = re.compile(r"\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.(?!\s?[А-ЯЁ]\.)")
 RE_TITLE_O       = re.compile(r"^\s*Об?\s+[а-яёА-ЯЁ]")
-RE_ORG_NOM       = re.compile(r"\b(ООО|АО|ПАО|ОАО|Министерство|Управление|Федеральная|Правительство|Администрация|ФНС|УФНС|МИ ФНС|ИФНС)\b")
+# Корни наименований госорганов/орг-форм без жёсткой привязки к падежу
+RE_ORG_NOM       = re.compile(r"\b(ООО|АО|ПАО|ОАО|Министерств|Управлени|Федеральн|Правительств|Администраци|Канцеляри|ФНС|УФНС|ИФНС|Межрегиональн|Инспекци|Департамент|Комитет|Служб)")
 
 # ---------- параметры из Памятки ----------
 MARGIN_LEFT_MM   = 30
@@ -86,18 +86,19 @@ def _is_body_para(p) -> bool:
 
 
 def _top_paragraphs(doc, limit: int = 30) -> List[Paragraph]:
-    """Параграфы в документном порядке, включая ячейки таблиц (для шапки)."""
+    """Параграфы в документном порядке, включая ячейки таблиц (для шапки).
+    Итерация идёт по сырому XML — это снимает проблему дублирования
+    параграфов в объединённых ячейках, которое даёт Table.rows[*].cells."""
     result: List[Paragraph] = []
     body = doc.element.body
     for child in body.iterchildren():
         if child.tag == qn("w:p"):
             result.append(Paragraph(child, doc))
         elif child.tag == qn("w:tbl"):
-            tbl = Table(child, doc)
-            for row in tbl.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        result.append(p)
+            for tr in child.iter(qn("w:tr")):
+                for tc in tr.findall(qn("w:tc")):
+                    for p_elem in tc.findall(qn("w:p")):
+                        result.append(Paragraph(p_elem, doc))
         if len(result) >= limit:
             break
     return result[:limit]
@@ -109,20 +110,21 @@ def _left_indent_cm(p: Paragraph) -> float:
 
 
 def _in_right_block(p: Paragraph) -> bool:
-    """Эвристика: параграф относится к правому блоку шапки."""
+    """Эвристика: параграф относится к правому блоку шапки.
+    True если: выравнивание по правому краю, или левый отступ > 7 см,
+    или параграф находится в последней w:tc своей строки таблицы."""
     if p.alignment == WD_ALIGN_PARAGRAPH.RIGHT:
         return True
     if _left_indent_cm(p) > 7.0:
         return True
-    # параграф в правой ячейке таблицы шапки
-    parent = p._element.getparent()
-    if parent is not None and parent.tag == qn("w:tc"):
-        tr = parent.getparent()
-        if tr is not None and tr.tag == qn("w:tr"):
-            cells = tr.findall(qn("w:tc"))
-            if len(cells) >= 2 and cells[-1] is parent:
-                return True
-    return False
+    tc = p._element.getparent()
+    if tc is None or tc.tag != qn("w:tc"):
+        return False
+    tr = tc.getparent()
+    if tr is None or tr.tag != qn("w:tr"):
+        return False
+    tcs = tr.findall(qn("w:tc"))
+    return len(tcs) >= 2 and tcs[-1] is tc
 
 
 # ---------- проверки ----------
@@ -214,19 +216,134 @@ def collect_issues(doc) -> List[Issue]:
         issues.append(Issue("EXEC", "Не найдена отметка об исполнителе (телефон 8(код)номер).", False))
 
     _check_header(doc, issues)
+    _check_blank(doc, issues, _blank_template_path(getattr(collect_issues, "_blank_override", None)))
 
     return issues
 
 
+def _blank_template_path(override: str | None = None) -> Path:
+    """Путь к blank_template.txt: --blank-template > рядом со скриптом > в корне doc_validator."""
+    if override:
+        return Path(override)
+    here = Path(__file__).resolve().parent
+    candidates = [here / "blank_template.txt", here.parent / "blank_template.txt"]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[-1]
+
+
+def _load_blank_template(config_path: Path) -> list:
+    """Парсит blank_template.txt → список {pattern, is_regex, optional, raw}."""
+    if not config_path.exists():
+        return []
+    items = []
+    for raw in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        optional = False
+        is_regex = False
+        if line.startswith("?"):
+            optional = True
+            line = line[1:].lstrip()
+        if line.startswith("re:"):
+            is_regex = True
+            line = line[3:]
+        if not line:
+            continue
+        items.append({
+            "pattern": line,
+            "is_regex": is_regex,
+            "optional": optional,
+            "raw": raw.strip(),
+        })
+    return items
+
+
+def _blank_text(doc) -> str:
+    """Текст левой части шапки. Берёт первую таблицу (типичный бланк-таблица)
+    и собирает уникальные w:tc в левой половине; если таблицы нет — собирает
+    параграфы вне правого блока в верхней части документа."""
+    if doc.tables:
+        tbl = doc.tables[0]._element
+        all_rows = tbl.findall(qn("w:tr"))
+        # Найти максимальное число tc по строкам — это «ширина» сетки в tc
+        max_tcs = max((len(tr.findall(qn("w:tc"))) for tr in all_rows), default=0)
+        half = max(1, max_tcs // 2) if max_tcs >= 2 else 1
+        seen = set()
+        parts = []
+        for tr in all_rows:
+            tcs = tr.findall(qn("w:tc"))
+            for idx, tc in enumerate(tcs):
+                if idx >= half:
+                    break  # это уже правая половина
+                if id(tc) in seen:
+                    continue
+                seen.add(id(tc))
+                for p_elem in tc.findall(qn("w:p")):
+                    text = Paragraph(p_elem, doc).text
+                    if text.strip():
+                        parts.append(text)
+        return "\n".join(parts)
+    # без таблицы — параграфы из шапки, которые НЕ в правом блоке
+    top = _top_paragraphs(doc, limit=60)
+    return "\n".join(p.text for p in top if not _in_right_block(p) and p.text.strip())
+
+
+def _check_blank(doc, issues: List[Issue], config_path: Path) -> None:
+    items = _load_blank_template(config_path)
+    if not items:
+        # Конфиг не настроен — молча пропускаем.
+        # Чтобы пользователь видел, что проверка отключена, можно добавить
+        # информационное сообщение, но я оставляю «тихо».
+        return
+    blank_text = _blank_text(doc)
+    for item in items:
+        if item["is_regex"]:
+            try:
+                found = bool(re.search(item["pattern"], blank_text))
+            except re.error:
+                issues.append(Issue("BLANK_BAD_REGEX",
+                    f"Некорректное regexp в blank_template.txt: «{item['raw']}».", False))
+                continue
+        else:
+            found = item["pattern"] in blank_text
+        if not found:
+            label = item["pattern"] if not item["is_regex"] else f"(regex) {item['pattern']}"
+            if item["optional"]:
+                issues.append(Issue("BLANK_OPTIONAL",
+                    f"В бланке не найдено (необязательно): «{label}».", False))
+            else:
+                issues.append(Issue("BLANK_MISSING",
+                    f"В бланке не найдено: «{label}».", False))
+
+
 def _check_header(doc, issues: List[Issue]) -> None:
     """Проверка шапки документа (правая часть): гриф ДСП, адресат, инициалы, заголовок."""
-    top = _top_paragraphs(doc, limit=30)
+    top = _top_paragraphs(doc, limit=60)
     if not top:
         return
 
     right_block = [p for p in top if _in_right_block(p) and p.text.strip()]
     right_text = "\n".join(p.text for p in right_block)
     full_top_text = "\n".join(p.text for p in top)
+
+    # Группируем параграфы правой части по родительской ячейке (w:tc),
+    # чтобы отличать «ссылку на № входящего» от собственно адресата.
+    from collections import OrderedDict
+    groups: "OrderedDict[int, list]" = OrderedDict()
+    for p in right_block:
+        tc = p._element.getparent()
+        key = id(tc) if tc is not None and tc.tag == qn("w:tc") else 0
+        groups.setdefault(key, []).append(p)
+
+    adresat_paras: List[Paragraph] = []
+    for paras in groups.values():
+        joined = "\n".join(p.text for p in paras)
+        if RE_FIO_DOT.search(joined) or RE_FULL_NAME.search(joined) or RE_ORG_NOM.search(joined):
+            adresat_paras = paras
+            break
 
     # --- Гриф ДСП ---
     dsp_in_doc = bool(re.search(r"(?i)для служебного пользования", full_top_text))
@@ -252,23 +369,21 @@ def _check_header(doc, issues: List[Issue]) -> None:
             "Не найден блок адресата в правой верхней части документа.",
             False,
         ))
+    elif not adresat_paras:
+        issues.append(Issue(
+            "ADRESAT_MISSING",
+            "Блок справа есть, но в нём не найдены ни ФИО, ни наименование организации.",
+            False,
+        ))
     else:
-        # отсеиваем гриф/экз из «адресатных» строк
-        adresat_paras = [
-            p for p in right_block
-            if not re.search(r"(?i)для служебного пользования|экз\.?\s*№", p.text)
-        ]
-
-        has_fio  = bool(RE_FIO_DOT.search(right_text) or RE_FULL_NAME.search(right_text))
-        has_org  = bool(RE_ORG_NOM.search(right_text))
-        if adresat_paras and not (has_fio or has_org):
-            issues.append(Issue(
-                "ADRESAT_MISSING",
-                "Блок справа есть, но в нём не найдены ни ФИО, ни наименование организации.",
-                False,
-            ))
-
-        if len(adresat_paras) >= 2:
+        # Проверка выравнивания — только если адресат не в таблице
+        # (в табличном бланке выравнивание задаёт сама ячейка).
+        in_table = any(
+            p._element.getparent() is not None
+            and p._element.getparent().tag == qn("w:tc")
+            for p in adresat_paras
+        )
+        if not in_table and len(adresat_paras) >= 2:
             alignments = {p.alignment for p in adresat_paras}
             indents    = {round(_left_indent_cm(p), 1) for p in adresat_paras}
             if len(alignments) > 1 or len(indents) > 1:
@@ -281,14 +396,12 @@ def _check_header(doc, issues: List[Issue]) -> None:
         for p in adresat_paras:
             pf = p.paragraph_format
             rule, ls = pf.line_spacing_rule, pf.line_spacing
+            bad = False
             if rule == WD_LINE_SPACING.MULTIPLE and ls is not None and float(ls) > 1.05:
-                issues.append(Issue(
-                    "ADRESAT_SPACING",
-                    "Межстрочный интервал в адресате не 1.0.",
-                    False,
-                ))
-                break
-            if rule == WD_LINE_SPACING.ONE_POINT_FIVE or rule == WD_LINE_SPACING.DOUBLE:
+                bad = True
+            elif rule in (WD_LINE_SPACING.ONE_POINT_FIVE, WD_LINE_SPACING.DOUBLE):
+                bad = True
+            if bad:
                 issues.append(Issue(
                     "ADRESAT_SPACING",
                     "Межстрочный интервал в адресате не 1.0.",
@@ -311,26 +424,17 @@ def _check_header(doc, issues: List[Issue]) -> None:
         ))
 
     # --- Заголовок «О...» / «Об...» ---
-    title_found = False
-    # Ищем после адресата, в первых 30 параграфах
-    start_idx = 0
-    if right_block:
-        last_right = right_block[-1]
-        for i, p in enumerate(top):
-            if p is last_right:
-                start_idx = i + 1
-                break
-    for p in top[start_idx:]:
-        t = p.text.strip()
-        if not t:
-            continue
-        if RE_TITLE_O.match(t):
-            title_found = True
-            break
+    # Ищем в пределах всей шапки (порядок обхода ячеек таблицы может не совпадать
+    # с визуальным «под адресатом»).
+    title_found = any(
+        RE_TITLE_O.match(p.text.strip())
+        for p in top
+        if p.text.strip()
+    )
     if not title_found:
         issues.append(Issue(
             "TITLE_MISSING",
-            "Не найден заголовок к тексту «О …»/«Об …» под адресатом (п. 4 Памятки).",
+            "Не найден заголовок к тексту «О …»/«Об …» в шапке (п. 4 Памятки).",
             False,
         ))
 
@@ -426,6 +530,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fix", action="store_true", help="Применить автоисправление")
     ap.add_argument("--yes", "-y", action="store_true", help="Не задавать вопрос «исправить?»")
     ap.add_argument("--in-place", action="store_true", help="Перезаписать исходный файл (с .bak)")
+    ap.add_argument("--blank-template", help="Путь к blank_template.txt (по умолчанию — рядом со скриптом)")
     return ap.parse_args()
 
 
@@ -443,6 +548,8 @@ def main() -> int:
         print(f"Файл не найден: {path}")
         return 2
 
+    if args.blank_template:
+        collect_issues._blank_override = args.blank_template  # type: ignore[attr-defined]
     doc = Document(str(path))
     issues = collect_issues(doc)
 

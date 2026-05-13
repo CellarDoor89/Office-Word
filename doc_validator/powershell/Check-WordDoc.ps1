@@ -25,7 +25,8 @@
 param(
     [string]$Path,
     [switch]$Fix,
-    [switch]$InPlace
+    [switch]$InPlace,
+    [string]$BlankTemplate
 )
 
 # ---------- параметры из Памятки ----------
@@ -141,6 +142,7 @@ function Collect-Issues($doc) {
     }
 
     Check-Header $doc $issues
+    Check-Blank  $doc $issues
 
     return ,$issues
 }
@@ -163,7 +165,7 @@ function Is-RightBlockPara($p) {
 }
 
 function Check-Header($doc, $issues) {
-    $limit = 30
+    $limit = 60
     $topParas = New-Object System.Collections.Generic.List[object]
     $i = 0
     foreach ($p in $doc.Paragraphs) {
@@ -202,7 +204,7 @@ function Check-Header($doc, $issues) {
 
         $hasFio = ($rightText -cmatch '[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.') -or `
                   ($rightText -cmatch '[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}')
-        $hasOrg = $rightText -match 'ООО|АО|ПАО|ОАО|Министерство|Управление|Федеральная|Правительство|Администрация|ФНС|УФНС|ИФНС'
+        $hasOrg = $rightText -match 'ООО|АО|ПАО|ОАО|Министерств|Управлени|Федеральн|Правительств|Администраци|Канцеляри|ФНС|УФНС|ИФНС|Межрегиональн|Инспекци|Департамент|Комитет|Служб'
 
         if ($adresatParas -and -not ($hasFio -or $hasOrg)) {
             $issues.Add(@{ Code='ADRESAT_MISSING'; Fixable=$false; Text='Блок справа есть, но в нём не найдены ни ФИО, ни наименование организации.' })
@@ -236,22 +238,102 @@ function Check-Header($doc, $issues) {
         $issues.Add(@{ Code='INITIALS_BAD'; Fixable=$false; Text='У фамилии указан только один инициал (нужно два: «Фамилия И.О.»).' })
     }
 
-    # --- Заголовок «О …»/«Об …» ---
-    $startIdx = 0
-    if ($rightParas.Count -gt 0) {
-        $lastRight = $rightParas[$rightParas.Count - 1]
-        for ($k = 0; $k -lt $topParas.Count; $k++) {
-            if ($topParas[$k] -eq $lastRight) { $startIdx = $k + 1; break }
-        }
-    }
+    # --- Заголовок «О …»/«Об …» (в пределах всей шапки) ---
     $titleFound = $false
-    for ($k = $startIdx; $k -lt $topParas.Count; $k++) {
-        $t = $topParas[$k].Range.Text.Trim()
+    foreach ($p in $topParas) {
+        $t = $p.Range.Text.Trim()
         if ($t.Length -eq 0) { continue }
         if ($t -cmatch '^\s*Об?\s+[а-яёА-ЯЁ]') { $titleFound = $true; break }
     }
     if (-not $titleFound) {
-        $issues.Add(@{ Code='TITLE_MISSING'; Fixable=$false; Text='Не найден заголовок к тексту «О …»/«Об …» под адресатом (п. 4 Памятки).' })
+        $issues.Add(@{ Code='TITLE_MISSING'; Fixable=$false; Text='Не найден заголовок к тексту «О …»/«Об …» в шапке (п. 4 Памятки).' })
+    }
+}
+
+function Get-BlankTemplatePath {
+    if ($script:BlankTemplate -and (Test-Path -LiteralPath $script:BlankTemplate)) {
+        return (Resolve-Path -LiteralPath $script:BlankTemplate).Path
+    }
+    $candidates = @(
+        Join-Path $PSScriptRoot 'blank_template.txt'
+        Join-Path (Split-Path -Parent $PSScriptRoot) 'blank_template.txt'
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { return (Resolve-Path -LiteralPath $c).Path }
+    }
+    return $null
+}
+
+function Load-BlankTemplate($path) {
+    $items = @()
+    foreach ($raw in [IO.File]::ReadAllLines($path, [Text.Encoding]::UTF8)) {
+        $line = $raw.Trim()
+        if (-not $line -or $line.StartsWith('#')) { continue }
+        $optional = $false; $isRegex = $false
+        if ($line.StartsWith('?'))  { $optional = $true; $line = $line.Substring(1).TrimStart() }
+        if ($line.StartsWith('re:')){ $isRegex  = $true; $line = $line.Substring(3) }
+        if (-not $line) { continue }
+        $items += [pscustomobject]@{ Pattern = $line; IsRegex = $isRegex; Optional = $optional }
+    }
+    return ,$items
+}
+
+function Get-BlankText($doc) {
+    if ($doc.Tables.Count -gt 0) {
+        $t = $doc.Tables.Item(1)
+        $maxTcs = 0
+        foreach ($row in $t.Rows) { if ($row.Cells.Count -gt $maxTcs) { $maxTcs = $row.Cells.Count } }
+        $half = [Math]::Max(1, [Math]::Floor($maxTcs / 2))
+        if ($maxTcs -lt 2) { $half = 1 }
+        $sb = New-Object Text.StringBuilder
+        foreach ($row in $t.Rows) {
+            $idx = 0
+            foreach ($cell in $row.Cells) {
+                $idx++
+                if ($idx -gt $half) { break }
+                $txt = $cell.Range.Text -replace "`a", ''  # remove cell marker
+                [void]$sb.AppendLine($txt)
+            }
+        }
+        return $sb.ToString()
+    }
+    # без таблицы: «нелевые» (т.е. не правые) параграфы шапки
+    $sb = New-Object Text.StringBuilder
+    $limit = 60; $i = 0
+    foreach ($p in $doc.Paragraphs) {
+        $i++; if ($i -gt $limit) { break }
+        if (-not (Is-RightBlockPara $p) -and $p.Range.Text.Trim().Length -gt 0) {
+            [void]$sb.AppendLine($p.Range.Text)
+        }
+    }
+    return $sb.ToString()
+}
+
+function Check-Blank($doc, $issues) {
+    $path = Get-BlankTemplatePath
+    if (-not $path) { return }
+    $items = Load-BlankTemplate $path
+    if ($items.Count -eq 0) { return }
+    $blankText = Get-BlankText $doc
+    foreach ($it in $items) {
+        $found = $false
+        if ($it.IsRegex) {
+            try { $found = [bool]([regex]::IsMatch($blankText, $it.Pattern)) }
+            catch {
+                $issues.Add(@{ Code='BLANK_BAD_REGEX'; Fixable=$false; Text="Некорректный regexp в blank_template.txt: «$($it.Pattern)»." })
+                continue
+            }
+        } else {
+            $found = $blankText.Contains($it.Pattern)
+        }
+        if (-not $found) {
+            $label = if ($it.IsRegex) { "(regex) $($it.Pattern)" } else { $it.Pattern }
+            if ($it.Optional) {
+                $issues.Add(@{ Code='BLANK_OPTIONAL'; Fixable=$false; Text="В бланке не найдено (необязательно): «$label»." })
+            } else {
+                $issues.Add(@{ Code='BLANK_MISSING'; Fixable=$false; Text="В бланке не найдено: «$label»." })
+            }
+        }
     }
 }
 
