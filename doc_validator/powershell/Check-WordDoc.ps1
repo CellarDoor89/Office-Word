@@ -139,11 +139,120 @@ function Collect-Issues($doc) {
     if ($bodyText -notmatch '8\(\d{3,5}\)\s?\d') {
         $issues.Add(@{ Code='EXEC'; Fixable=$false; Text='Не найдена отметка об исполнителе (телефон 8(код)номер).' })
     }
-    if ($bodyText -match '(?i)для служебного пользования' -and $bodyText -notmatch '(?i)экз\.?\s*№') {
-        $issues.Add(@{ Code='DSP'; Fixable=$false; Text='«Для служебного пользования» без номера экземпляра.' })
-    }
+
+    Check-Header $doc $issues
 
     return ,$issues
+}
+
+function Is-RightBlockPara($p) {
+    $wdAlignRight   = 2
+    $wdWithInTable  = 12
+    if ($p.Format.Alignment -eq $wdAlignRight) { return $true }
+    $indCm = PointsToCentimeters $p.Format.LeftIndent
+    if ($indCm -gt 7) { return $true }
+    try {
+        if ($p.Range.Information($wdWithInTable)) {
+            $cells = $p.Range.Cells
+            if ($cells -and $cells.Count -gt 0) {
+                if ($cells.Item(1).ColumnIndex -ge 2) { return $true }
+            }
+        }
+    } catch { }
+    return $false
+}
+
+function Check-Header($doc, $issues) {
+    $limit = 30
+    $topParas = New-Object System.Collections.Generic.List[object]
+    $i = 0
+    foreach ($p in $doc.Paragraphs) {
+        $i++
+        if ($i -gt $limit) { break }
+        $topParas.Add($p)
+    }
+    if ($topParas.Count -eq 0) { return }
+
+    $topText = ''
+    $rightParas = New-Object System.Collections.Generic.List[object]
+    $rightText = ''
+    foreach ($p in $topParas) {
+        $topText += "$($p.Range.Text)`n"
+        if ((Is-RightBlockPara $p) -and $p.Range.Text.Trim().Length -gt 0) {
+            $rightParas.Add($p)
+            $rightText += "$($p.Range.Text)`n"
+        }
+    }
+
+    # --- Гриф ДСП ---
+    if ($topText -match '(?i)для служебного пользования') {
+        if ($rightText -notmatch '(?i)для служебного пользования') {
+            $issues.Add(@{ Code='DSP_POS'; Fixable=$false; Text='«Для служебного пользования» найдено, но не в правом верхнем углу.' })
+        }
+        if ($topText -notmatch '(?i)экз\.?\s*№\s*\d') {
+            $issues.Add(@{ Code='DSP'; Fixable=$false; Text='«Для служебного пользования» без номера экземпляра («Экз. № …»).' })
+        }
+    }
+
+    # --- Адресат ---
+    if ($rightParas.Count -eq 0) {
+        $issues.Add(@{ Code='ADRESAT_MISSING'; Fixable=$false; Text='Не найден блок адресата в правой верхней части документа.' })
+    } else {
+        $adresatParas = $rightParas | Where-Object { $_.Range.Text -notmatch '(?i)для служебного пользования|экз\.?\s*№' }
+
+        $hasFio = ($rightText -cmatch '[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.') -or `
+                  ($rightText -cmatch '[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}')
+        $hasOrg = $rightText -match 'ООО|АО|ПАО|ОАО|Министерство|Управление|Федеральная|Правительство|Администрация|ФНС|УФНС|ИФНС'
+
+        if ($adresatParas -and -not ($hasFio -or $hasOrg)) {
+            $issues.Add(@{ Code='ADRESAT_MISSING'; Fixable=$false; Text='Блок справа есть, но в нём не найдены ни ФИО, ни наименование организации.' })
+        }
+
+        if ($adresatParas -and $adresatParas.Count -ge 2) {
+            $aligns  = $adresatParas | ForEach-Object { $_.Format.Alignment } | Select-Object -Unique
+            $indents = $adresatParas | ForEach-Object { [Math]::Round((PointsToCentimeters $_.Format.LeftIndent), 1) } | Select-Object -Unique
+            if ($aligns.Count -gt 1 -or $indents.Count -gt 1) {
+                $issues.Add(@{ Code='ADRESAT_ALIGN'; Fixable=$false; Text='Строки адресата выровнены неодинаково (должны быть по левому краю блока).' })
+            }
+        }
+
+        $badAdrSpacing = $false
+        foreach ($p in $adresatParas) {
+            $rule = $p.Format.LineSpacingRule
+            $ls   = $p.Format.LineSpacing
+            $sz   = $p.Range.Font.Size
+            if ($rule -eq 1 -or $rule -eq 2) { $badAdrSpacing = $true; break }
+            if ($rule -eq 5 -and $sz -gt 0 -and ($ls / $sz) -gt 1.05) { $badAdrSpacing = $true; break }
+        }
+        if ($badAdrSpacing) {
+            $issues.Add(@{ Code='ADRESAT_SPACING'; Fixable=$false; Text='Межстрочный интервал в адресате не 1.0.' })
+        }
+    }
+
+    # --- Формат инициалов ---
+    if ($rightText -cmatch '[А-ЯЁ][а-яё]+[А-ЯЁ]\.') {
+        $issues.Add(@{ Code='INITIALS_BAD'; Fixable=$false; Text='Инициалы записаны слитно с фамилией (нужно «Фамилия И.О.» через пробел).' })
+    } elseif (($rightText -cmatch '[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.') -and -not ($rightText -cmatch '[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.')) {
+        $issues.Add(@{ Code='INITIALS_BAD'; Fixable=$false; Text='У фамилии указан только один инициал (нужно два: «Фамилия И.О.»).' })
+    }
+
+    # --- Заголовок «О …»/«Об …» ---
+    $startIdx = 0
+    if ($rightParas.Count -gt 0) {
+        $lastRight = $rightParas[$rightParas.Count - 1]
+        for ($k = 0; $k -lt $topParas.Count; $k++) {
+            if ($topParas[$k] -eq $lastRight) { $startIdx = $k + 1; break }
+        }
+    }
+    $titleFound = $false
+    for ($k = $startIdx; $k -lt $topParas.Count; $k++) {
+        $t = $topParas[$k].Range.Text.Trim()
+        if ($t.Length -eq 0) { continue }
+        if ($t -cmatch '^\s*Об?\s+[а-яёА-ЯЁ]') { $titleFound = $true; break }
+    }
+    if (-not $titleFound) {
+        $issues.Add(@{ Code='TITLE_MISSING'; Fixable=$false; Text='Не найден заголовок к тексту «О …»/«Об …» под адресатом (п. 4 Памятки).' })
+    }
 }
 
 function Apply-Fixes($doc, $issues) {

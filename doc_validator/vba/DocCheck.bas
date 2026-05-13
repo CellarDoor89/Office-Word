@@ -48,7 +48,7 @@ Public Sub CheckDocument()
     GatherFontStyling doc, issues, cnt, fs
     GatherPageNumbers doc, issues, cnt
     GatherExecutor doc, issues, cnt
-    GatherRestrictedMark doc, issues, cnt
+    GatherHeader doc, issues, cnt
 
     If cnt = 0 Then
         MsgBox "Документ: " & doc.Name & vbCrLf & _
@@ -100,7 +100,7 @@ Public Sub CheckDocument()
     GatherFontStyling doc, issues2, cnt2, fs2
     GatherPageNumbers doc, issues2, cnt2
     GatherExecutor doc, issues2, cnt2
-    GatherRestrictedMark doc, issues2, cnt2
+    GatherHeader doc, issues2, cnt2
 
     Dim res As String
     res = "Исправление выполнено." & vbCrLf & String(50, "-") & vbCrLf
@@ -248,15 +248,176 @@ Private Sub GatherExecutor(doc As Document, issues() As Issue, ByRef cnt As Long
     End If
 End Sub
 
-Private Sub GatherRestrictedMark(doc As Document, issues() As Issue, ByRef cnt As Long)
-    Dim t As String
-    t = LCase$(doc.Range.Text)
-    If InStr(t, "для служебного пользования") > 0 Then
-        If InStr(t, "экз.") = 0 And InStr(t, "экз №") = 0 Then
-            AddIssue issues, cnt, "«Для служебного пользования» без номера экземпляра.", False, "DSP"
+Private Sub GatherHeader(doc As Document, issues() As Issue, ByRef cnt As Long)
+    ' Собираем «шапочные» параграфы: первые 30 параграфов документа.
+    ' В Word doc.Paragraphs включает параграфы в ячейках таблиц, так что
+    ' табличная шапка тоже попадёт сюда.
+    Const LIMIT As Long = 30
+    Dim topParas As Collection
+    Set topParas = New Collection
+    Dim i As Long, para As Paragraph
+    i = 0
+    For Each para In doc.Paragraphs
+        i = i + 1
+        If i > LIMIT Then Exit For
+        topParas.Add para
+    Next para
+    If topParas.Count = 0 Then Exit Sub
+
+    ' Правый блок: alignment=Right или левый отступ > 7 см, или ячейка таблицы — последний столбец
+    Dim rightText As String, topText As String
+    Dim rightParas As Collection
+    Set rightParas = New Collection
+    Dim p As Paragraph
+    For Each p In topParas
+        topText = topText & p.Range.Text & vbLf
+        If IsRightBlockPara(p) Then
+            If Len(Trim$(p.Range.Text)) > 0 Then
+                rightParas.Add p
+                rightText = rightText & p.Range.Text & vbLf
+            End If
+        End If
+    Next p
+
+    Dim rx As Object
+    Set rx = CreateObject("VBScript.RegExp")
+    rx.IgnoreCase = True
+    rx.Global = False
+
+    ' --- Гриф ДСП ---
+    rx.Pattern = "для служебного пользования"
+    If rx.Test(topText) Then
+        If Not rx.Test(rightText) Then
+            AddIssue issues, cnt, "«Для служебного пользования» найдено, но не в правом верхнем углу.", False, "DSP_POS"
+        End If
+        rx.Pattern = "экз\.?\s*№\s*\d"
+        If Not rx.Test(topText) Then
+            AddIssue issues, cnt, "«Для служебного пользования» без номера экземпляра («Экз. № …»).", False, "DSP"
         End If
     End If
+
+    ' --- Адресат ---
+    If rightParas.Count = 0 Then
+        AddIssue issues, cnt, "Не найден блок адресата в правой верхней части документа.", False, "ADRESAT_MISSING"
+    Else
+        Dim adresatParas As Collection
+        Set adresatParas = New Collection
+        rx.Pattern = "для служебного пользования|экз\.?\s*№"
+        For Each p In rightParas
+            If Not rx.Test(p.Range.Text) Then adresatParas.Add p
+        Next p
+
+        rx.IgnoreCase = False
+        rx.Pattern = "[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\."
+        Dim hasFio As Boolean: hasFio = rx.Test(rightText)
+        rx.Pattern = "[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}"
+        If Not hasFio Then hasFio = rx.Test(rightText)
+        rx.Pattern = "ООО|АО|ПАО|ОАО|Министерство|Управление|Федеральная|Правительство|Администрация|ФНС|УФНС|ИФНС"
+        Dim hasOrg As Boolean: hasOrg = rx.Test(rightText)
+
+        If adresatParas.Count > 0 And Not (hasFio Or hasOrg) Then
+            AddIssue issues, cnt, "Блок справа есть, но в нём не найдены ни ФИО, ни наименование организации.", False, "ADRESAT_MISSING"
+        End If
+
+        ' Выравнивание / отступы внутри блока
+        If adresatParas.Count >= 2 Then
+            Dim firstAlign As Long, firstIndent As Double
+            Dim ap As Paragraph, mixedAlign As Boolean, mixedIndent As Boolean
+            Set ap = adresatParas(1)
+            firstAlign = ap.Format.Alignment
+            firstIndent = PointsToCentimeters(ap.Format.LeftIndent)
+            Dim j As Long
+            For j = 2 To adresatParas.Count
+                Set ap = adresatParas(j)
+                If ap.Format.Alignment <> firstAlign Then mixedAlign = True
+                If Abs(PointsToCentimeters(ap.Format.LeftIndent) - firstIndent) > 0.1 Then mixedIndent = True
+            Next j
+            If mixedAlign Or mixedIndent Then
+                AddIssue issues, cnt, "Строки адресата выровнены неодинаково (должны быть по левому краю блока).", False, "ADRESAT_ALIGN"
+            End If
+        End If
+
+        ' Межстрочный в адресате должен быть одинарный
+        Dim badAdrSpacing As Boolean
+        For Each p In adresatParas
+            Dim lsr As Long, ls As Single
+            lsr = p.Format.LineSpacingRule
+            If lsr = wdLineSpace1pt5 Or lsr = wdLineSpaceDouble Then badAdrSpacing = True
+            If lsr = wdLineSpaceMultiple And p.Range.Font.Size > 0 Then
+                If (p.Format.LineSpacing / p.Range.Font.Size) > 1.05 Then badAdrSpacing = True
+            End If
+        Next p
+        If badAdrSpacing Then
+            AddIssue issues, cnt, "Межстрочный интервал в адресате не 1.0.", False, "ADRESAT_SPACING"
+        End If
+    End If
+
+    ' --- Формат инициалов ---
+    rx.IgnoreCase = False
+    rx.Pattern = "[А-ЯЁ][а-яё]+[А-ЯЁ]\."
+    If rx.Test(rightText) Then
+        AddIssue issues, cnt, "Инициалы записаны слитно с фамилией (нужно «Фамилия И.О.» через пробел).", False, "INITIALS_BAD"
+    Else
+        rx.Pattern = "[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\."
+        Dim hasGood As Boolean: hasGood = rx.Test(rightText)
+        rx.Pattern = "[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\."
+        If rx.Test(rightText) And Not hasGood Then
+            AddIssue issues, cnt, "У фамилии указан только один инициал (нужно два: «Фамилия И.О.»).", False, "INITIALS_BAD"
+        End If
+    End If
+
+    ' --- Заголовок «О …»/«Об …» ---
+    Dim startIdx As Long: startIdx = 0
+    If rightParas.Count > 0 Then
+        Dim lastRight As Paragraph
+        Set lastRight = rightParas(rightParas.Count)
+        Dim k As Long: k = 0
+        For Each p In topParas
+            k = k + 1
+            If p Is lastRight Then startIdx = k: Exit For
+        Next p
+    End If
+    rx.IgnoreCase = False
+    rx.Pattern = "^\s*Об?\s+[а-яёА-ЯЁ]"
+    Dim titleFound As Boolean
+    k = 0
+    For Each p In topParas
+        k = k + 1
+        If k > startIdx Then
+            Dim t2 As String
+            t2 = Trim$(p.Range.Text)
+            If Len(t2) > 0 Then
+                If rx.Test(t2) Then titleFound = True: Exit For
+            End If
+        End If
+    Next p
+    If Not titleFound Then
+        AddIssue issues, cnt, "Не найден заголовок к тексту «О …»/«Об …» под адресатом (п. 4 Памятки).", False, "TITLE_MISSING"
+    End If
 End Sub
+
+Private Function IsRightBlockPara(p As Paragraph) As Boolean
+    IsRightBlockPara = False
+    If p.Format.Alignment = wdAlignParagraphRight Then
+        IsRightBlockPara = True
+        Exit Function
+    End If
+    If PointsToCentimeters(p.Format.LeftIndent) > 7 Then
+        IsRightBlockPara = True
+        Exit Function
+    End If
+    ' Параграф внутри таблицы: правый блок = не первый столбец строки
+    On Error Resume Next
+    If p.Range.Information(wdWithInTable) Then
+        Dim c As cell
+        Set c = p.Range.Cells(1)
+        If Err.Number = 0 Then
+            If c.ColumnIndex >= 2 Then IsRightBlockPara = True
+        End If
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
 
 ' --------------------------------------------------------------
 '  Применение исправлений

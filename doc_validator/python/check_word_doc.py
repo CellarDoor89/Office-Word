@@ -21,7 +21,19 @@ from docx import Document
 from docx.enum.text import WD_LINE_SPACING, WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.shared import Cm, Mm, Pt
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from lxml import etree
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+# ---------- регулярки для шапки ----------
+RE_FIO_DOT       = re.compile(r"\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.")
+RE_FULL_NAME     = re.compile(r"\b[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\b")
+RE_FIO_BAD_GLUED = re.compile(r"[А-ЯЁ][а-яё]+[А-ЯЁ]\.")
+RE_FIO_ONE_INIT  = re.compile(r"\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.(?!\s?[А-ЯЁ]\.)")
+RE_TITLE_O       = re.compile(r"^\s*Об?\s+[а-яёА-ЯЁ]")
+RE_ORG_NOM       = re.compile(r"\b(ООО|АО|ПАО|ОАО|Министерство|Управление|Федеральная|Правительство|Администрация|ФНС|УФНС|МИ ФНС|ИФНС)\b")
 
 # ---------- параметры из Памятки ----------
 MARGIN_LEFT_MM   = 30
@@ -71,6 +83,46 @@ def _is_body_para(p) -> bool:
         return False
     style_name = (p.style.name or "").lower()
     return "heading" not in style_name and "заголовок" not in style_name
+
+
+def _top_paragraphs(doc, limit: int = 30) -> List[Paragraph]:
+    """Параграфы в документном порядке, включая ячейки таблиц (для шапки)."""
+    result: List[Paragraph] = []
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            result.append(Paragraph(child, doc))
+        elif child.tag == qn("w:tbl"):
+            tbl = Table(child, doc)
+            for row in tbl.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        result.append(p)
+        if len(result) >= limit:
+            break
+    return result[:limit]
+
+
+def _left_indent_cm(p: Paragraph) -> float:
+    li = p.paragraph_format.left_indent
+    return emu_to_cm(li) if li is not None else 0.0
+
+
+def _in_right_block(p: Paragraph) -> bool:
+    """Эвристика: параграф относится к правому блоку шапки."""
+    if p.alignment == WD_ALIGN_PARAGRAPH.RIGHT:
+        return True
+    if _left_indent_cm(p) > 7.0:
+        return True
+    # параграф в правой ячейке таблицы шапки
+    parent = p._element.getparent()
+    if parent is not None and parent.tag == qn("w:tc"):
+        tr = parent.getparent()
+        if tr is not None and tr.tag == qn("w:tr"):
+            cells = tr.findall(qn("w:tc"))
+            if len(cells) >= 2 and cells[-1] is parent:
+                return True
+    return False
 
 
 # ---------- проверки ----------
@@ -160,11 +212,127 @@ def collect_issues(doc) -> List[Issue]:
     full = "\n".join(p.text for p in doc.paragraphs)
     if not re.search(r"8\(\d{3,5}\)\s?\d", full):
         issues.append(Issue("EXEC", "Не найдена отметка об исполнителе (телефон 8(код)номер).", False))
-    if re.search(r"(?i)для служебного пользования", full):
-        if not re.search(r"(?i)экз\.?\s*№", full):
-            issues.append(Issue("DSP", "«Для служебного пользования» без номера экземпляра.", False))
+
+    _check_header(doc, issues)
 
     return issues
+
+
+def _check_header(doc, issues: List[Issue]) -> None:
+    """Проверка шапки документа (правая часть): гриф ДСП, адресат, инициалы, заголовок."""
+    top = _top_paragraphs(doc, limit=30)
+    if not top:
+        return
+
+    right_block = [p for p in top if _in_right_block(p) and p.text.strip()]
+    right_text = "\n".join(p.text for p in right_block)
+    full_top_text = "\n".join(p.text for p in top)
+
+    # --- Гриф ДСП ---
+    dsp_in_doc = bool(re.search(r"(?i)для служебного пользования", full_top_text))
+    if dsp_in_doc:
+        dsp_in_right = bool(re.search(r"(?i)для служебного пользования", right_text))
+        if not dsp_in_right:
+            issues.append(Issue(
+                "DSP_POS",
+                "«Для служебного пользования» найдено, но не в правом верхнем углу.",
+                False,
+            ))
+        if not re.search(r"(?i)экз\.?\s*№\s*\d", full_top_text):
+            issues.append(Issue(
+                "DSP",
+                "«Для служебного пользования» без номера экземпляра («Экз. № …»).",
+                False,
+            ))
+
+    # --- Адресат ---
+    if not right_block:
+        issues.append(Issue(
+            "ADRESAT_MISSING",
+            "Не найден блок адресата в правой верхней части документа.",
+            False,
+        ))
+    else:
+        # отсеиваем гриф/экз из «адресатных» строк
+        adresat_paras = [
+            p for p in right_block
+            if not re.search(r"(?i)для служебного пользования|экз\.?\s*№", p.text)
+        ]
+
+        has_fio  = bool(RE_FIO_DOT.search(right_text) or RE_FULL_NAME.search(right_text))
+        has_org  = bool(RE_ORG_NOM.search(right_text))
+        if adresat_paras and not (has_fio or has_org):
+            issues.append(Issue(
+                "ADRESAT_MISSING",
+                "Блок справа есть, но в нём не найдены ни ФИО, ни наименование организации.",
+                False,
+            ))
+
+        if len(adresat_paras) >= 2:
+            alignments = {p.alignment for p in adresat_paras}
+            indents    = {round(_left_indent_cm(p), 1) for p in adresat_paras}
+            if len(alignments) > 1 or len(indents) > 1:
+                issues.append(Issue(
+                    "ADRESAT_ALIGN",
+                    "Строки адресата выровнены неодинаково (должны быть по левому краю блока).",
+                    False,
+                ))
+
+        for p in adresat_paras:
+            pf = p.paragraph_format
+            rule, ls = pf.line_spacing_rule, pf.line_spacing
+            if rule == WD_LINE_SPACING.MULTIPLE and ls is not None and float(ls) > 1.05:
+                issues.append(Issue(
+                    "ADRESAT_SPACING",
+                    "Межстрочный интервал в адресате не 1.0.",
+                    False,
+                ))
+                break
+            if rule == WD_LINE_SPACING.ONE_POINT_FIVE or rule == WD_LINE_SPACING.DOUBLE:
+                issues.append(Issue(
+                    "ADRESAT_SPACING",
+                    "Межстрочный интервал в адресате не 1.0.",
+                    False,
+                ))
+                break
+
+    # --- Формат инициалов ---
+    if RE_FIO_BAD_GLUED.search(right_text):
+        issues.append(Issue(
+            "INITIALS_BAD",
+            "Инициалы записаны слитно с фамилией (нужно «Фамилия И.О.» через пробел).",
+            False,
+        ))
+    elif RE_FIO_ONE_INIT.search(right_text) and not RE_FIO_DOT.search(right_text):
+        issues.append(Issue(
+            "INITIALS_BAD",
+            "У фамилии указан только один инициал (нужно два: «Фамилия И.О.»).",
+            False,
+        ))
+
+    # --- Заголовок «О...» / «Об...» ---
+    title_found = False
+    # Ищем после адресата, в первых 30 параграфах
+    start_idx = 0
+    if right_block:
+        last_right = right_block[-1]
+        for i, p in enumerate(top):
+            if p is last_right:
+                start_idx = i + 1
+                break
+    for p in top[start_idx:]:
+        t = p.text.strip()
+        if not t:
+            continue
+        if RE_TITLE_O.match(t):
+            title_found = True
+            break
+    if not title_found:
+        issues.append(Issue(
+            "TITLE_MISSING",
+            "Не найден заголовок к тексту «О …»/«Об …» под адресатом (п. 4 Памятки).",
+            False,
+        ))
 
 
 # ---------- исправления ----------
