@@ -156,10 +156,59 @@ Private Sub GatherMargins(doc As Document, issues() As Issue, ByRef cnt As Long,
     hasLetterhead = HasLetterhead(doc)
 
     If Not m.LeftOk Then AddIssue issues, cnt, "Левое поле " & Format$(L, "0.0") & " мм (нужно 30 мм).", True, "MARGIN_L"
-    If Not m.TopOk And Not hasLetterhead Then AddIssue issues, cnt, "Верхнее поле " & Format$(T, "0.0") & " мм (нужно 20 мм).", True, "MARGIN_T"
+    If hasLetterhead Then
+        ' Считаем фактический отступ от верха страницы до первого текста бланка
+        Dim offsetMM As Double
+        offsetMM = LetterheadTopOffsetMM(doc, T)
+        If offsetMM < MARGIN_TOP_MM - MM_TOLERANCE Then
+            AddIssue issues, cnt, _
+                "Содержимое бланка начинается на " & Format$(offsetMM, "0.0") & _
+                " мм от верха страницы (нужно ≥20 мм). Регистрационный номер при подписи может наложиться на герб/текст бланка.", _
+                False, "MARGIN_T_LETTERHEAD"
+        End If
+    ElseIf Not m.TopOk Then
+        AddIssue issues, cnt, "Верхнее поле " & Format$(T, "0.0") & " мм (нужно 20 мм).", True, "MARGIN_T"
+    End If
     If Not m.BottomOk Then AddIssue issues, cnt, "Нижнее поле " & Format$(B, "0.0") & " мм (нужно 20 мм).", True, "MARGIN_B"
     If Not m.RightOk Then AddIssue issues, cnt, "Правое поле " & Format$(R, "0.0") & " мм (нужно 10 мм).", True, "MARGIN_R"
 End Sub
+
+Private Function LetterheadTopOffsetMM(doc As Document, topMarginMM As Double) As Double
+    ' Считаем расстояние от верха страницы до первого непустого текста бланка:
+    ' верхнее поле + высоты ведущих пустых строк первой таблицы.
+    LetterheadTopOffsetMM = topMarginMM
+    If doc.Tables.Count = 0 Then Exit Function
+    Dim t As Table
+    Set t = doc.Tables(1)
+    Dim row As row
+    For Each row In t.Rows
+        Dim rowText As String
+        rowText = ""
+        Dim c As cell
+        On Error Resume Next
+        For Each c In row.Cells
+            Dim ct As String
+            ct = c.Range.Text
+            ct = Replace(ct, Chr(7), "")
+            ct = Replace(ct, Chr(13), "")
+            rowText = rowText & ct
+        Next c
+        On Error GoTo 0
+        If Len(Trim$(rowText)) > 0 Then Exit Function
+        ' пустая — добавляем высоту
+        Dim hMM As Double
+        On Error Resume Next
+        hMM = PointsToMillimeters(row.HeightRule * 0) ' просто инициализация
+        ' Высота в Points (если задана) или приближённая по умолчанию
+        If row.HeightRule <> wdRowHeightAuto Then
+            hMM = PointsToMillimeters(row.Height)
+        Else
+            hMM = 6  ' одна строка кегля 14 ~ 6 мм
+        End If
+        On Error GoTo 0
+        LetterheadTopOffsetMM = LetterheadTopOffsetMM + hMM
+    Next row
+End Function
 
 ' Документ начинается с таблицы (бланк с гербом)? Тогда верхнее поле
 ' интенционально уменьшено и проверяться не должно.

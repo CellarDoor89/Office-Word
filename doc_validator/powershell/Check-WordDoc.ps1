@@ -64,6 +64,31 @@ function Show-OpenDialog {
     $dlg.FileName
 }
 
+function Letterhead-TopOffsetMM($doc, $topMarginMM) {
+    # Сумма: верхнее поле + высоты ведущих пустых строк первой таблицы.
+    $offset = [double]$topMarginMM
+    if ($doc.Tables.Count -eq 0) { return $offset }
+    $t = $doc.Tables.Item(1)
+    $wdRowHeightAuto = 0
+    foreach ($row in $t.Rows) {
+        $rowText = ''
+        foreach ($cell in $row.Cells) {
+            $txt = $cell.Range.Text -replace "`a", '' -replace "`r", ''
+            $rowText += $txt
+        }
+        if ($rowText.Trim().Length -gt 0) { return $offset }
+        # пустая — добавляем высоту
+        try {
+            if ($row.HeightRule -ne $wdRowHeightAuto) {
+                $offset += (PointsToMillimeters $row.Height)
+            } else {
+                $offset += 6.0
+            }
+        } catch { $offset += 6.0 }
+    }
+    return $offset
+}
+
 function Has-Letterhead($doc) {
     # Документ начинается с таблицы (бланк с гербом)? Тогда верхнее поле
     # интенционально уменьшено и проверяться не должно.
@@ -94,7 +119,15 @@ function Collect-Issues($doc) {
     $hasLetterhead = Has-Letterhead $doc
 
     if ([Math]::Abs($leftMM   - $MARGIN_LEFT_MM)   -gt $MM_TOL) { $issues.Add(@{ Code='MARGIN_L'; Fixable=$true; Text="Левое поле $leftMM мм (нужно 30 мм)." }) }
-    if ((-not $hasLetterhead) -and ([Math]::Abs($topMM - $MARGIN_TOP_MM) -gt $MM_TOL)) { $issues.Add(@{ Code='MARGIN_T'; Fixable=$true; Text="Верхнее поле $topMM мм (нужно 20 мм)." }) }
+    if ($hasLetterhead) {
+        $offsetMM = Letterhead-TopOffsetMM $doc $topMM
+        if ($offsetMM -lt ($MARGIN_TOP_MM - $MM_TOL)) {
+            $offFmt = '{0:N1}' -f $offsetMM
+            $issues.Add(@{ Code='MARGIN_T_LETTERHEAD'; Fixable=$false; Text="Содержимое бланка начинается на $offFmt мм от верха страницы (нужно ≥20 мм). Регистрационный номер при подписи может наложиться на герб/текст бланка." })
+        }
+    } elseif ([Math]::Abs($topMM - $MARGIN_TOP_MM) -gt $MM_TOL) {
+        $issues.Add(@{ Code='MARGIN_T'; Fixable=$true; Text="Верхнее поле $topMM мм (нужно 20 мм)." })
+    }
     if ([Math]::Abs($bottomMM - $MARGIN_BOTTOM_MM) -gt $MM_TOL) { $issues.Add(@{ Code='MARGIN_B'; Fixable=$true; Text="Нижнее поле $bottomMM мм (нужно 20 мм)." }) }
     if ([Math]::Abs($rightMM  - $MARGIN_RIGHT_MM)  -gt $MM_TOL) { $issues.Add(@{ Code='MARGIN_R'; Fixable=$true; Text="Правое поле $rightMM мм (нужно 10 мм)." }) }
 

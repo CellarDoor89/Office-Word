@@ -149,6 +149,48 @@ def _has_letterhead(doc) -> bool:
     return False
 
 
+_TWIPS_PER_MM = 56.6929  # 1 мм = 56.6929 twips
+
+
+def _letterhead_top_offset_mm(doc) -> float | None:
+    """Возвращает примерное расстояние в мм от верха страницы до первого текста
+    в бланке (учитывая верхнее поле и пустые ведущие строки таблицы-бланка).
+    None — если бланка нет."""
+    if not _has_letterhead(doc):
+        return None
+    s = doc.sections[0]
+    offset_mm = emu_to_mm(s.top_margin)
+
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            text = "".join((t.text or "") for t in child.iter(qn("w:t"))).strip()
+            if text:
+                return offset_mm
+            continue
+        if child.tag != qn("w:tbl"):
+            continue
+        for tr in child.findall(qn("w:tr")):
+            row_text = "".join((t.text or "") for t in tr.iter(qn("w:t"))).strip()
+            if row_text:
+                return offset_mm
+            # пустая строка — добавляем её высоту
+            trPr = tr.find(qn("w:trPr"))
+            row_h_mm = None
+            if trPr is not None:
+                th = trPr.find(qn("w:trHeight"))
+                if th is not None:
+                    val = th.get(qn("w:val"))
+                    if val and val.lstrip("-").isdigit():
+                        row_h_mm = int(val) / _TWIPS_PER_MM
+            if row_h_mm is None:
+                # авто-высота — приблизительно одна строка кегля 14 (~6 мм)
+                row_h_mm = 6.0
+            offset_mm += row_h_mm
+        return offset_mm
+    return offset_mm
+
+
 def collect_issues(doc) -> List[Issue]:
     issues: List[Issue] = []
     s = doc.sections[0]
@@ -161,6 +203,16 @@ def collect_issues(doc) -> List[Issue]:
     ):
         if code == "MARGIN_T" and has_letterhead:
             # Бланк с гербом «съедает» верхнее поле — это интенционально.
+            # Зато проверяем фактический отступ до первого текста бланка.
+            offset = _letterhead_top_offset_mm(doc)
+            if offset is not None and offset < MARGIN_TOP_MM - MM_TOL:
+                issues.append(Issue(
+                    "MARGIN_T_LETTERHEAD",
+                    f"Содержимое бланка начинается на {offset:.1f} мм от верха страницы "
+                    f"(нужно ≥{MARGIN_TOP_MM} мм). Регистрационный номер при подписи "
+                    f"может наложиться на герб/текст бланка.",
+                    False,
+                ))
             continue
         if abs(actual - required) > MM_TOL:
             issues.append(Issue(code, f"{name} поле {actual} мм (нужно {required} мм).", True))
