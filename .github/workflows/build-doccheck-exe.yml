@@ -1,0 +1,55 @@
+name: Build DocCheck.exe
+
+on:
+  push:
+    paths:
+      - 'doc_validator/**'
+      - '.github/workflows/build-doccheck-exe.yml'
+  pull_request:
+    paths:
+      - 'doc_validator/**'
+      - '.github/workflows/build-doccheck-exe.yml'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r doc_validator/gui/requirements.txt
+
+      - name: Build .exe with PyInstaller
+        working-directory: doc_validator/gui
+        shell: cmd
+        run: |
+          python -m PyInstaller --onefile --windowed ^
+            --name DocCheck ^
+            --add-data "..\python\check_word_doc.py;." ^
+            --add-data "..\blank_template.txt;." ^
+            --collect-all tkinterdnd2 ^
+            app.py
+
+      - name: Bundle blank_template alongside the exe
+        shell: cmd
+        run: |
+          copy /Y doc_validator\blank_template.txt doc_validator\gui\dist\blank_template.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocCheck-windows
+          path: |
+            doc_validator/gui/dist/DocCheck.exe
+            doc_validator/gui/dist/blank_template.txt
+          if-no-files-found: error
+          retention-days: 90
