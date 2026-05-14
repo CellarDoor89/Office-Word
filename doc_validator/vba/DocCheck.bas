@@ -151,11 +151,44 @@ Private Sub GatherMargins(doc As Document, issues() As Issue, ByRef cnt As Long,
     m.TopOk = (Abs(T - MARGIN_TOP_MM) <= MM_TOLERANCE)
     m.BottomOk = (Abs(B - MARGIN_BOTTOM_MM) <= MM_TOLERANCE)
     m.RightOk = (Abs(R - MARGIN_RIGHT_MM) <= MM_TOLERANCE)
+
+    Dim hasLetterhead As Boolean
+    hasLetterhead = HasLetterhead(doc)
+
     If Not m.LeftOk Then AddIssue issues, cnt, "Левое поле " & Format$(L, "0.0") & " мм (нужно 30 мм).", True, "MARGIN_L"
-    If Not m.TopOk Then AddIssue issues, cnt, "Верхнее поле " & Format$(T, "0.0") & " мм (нужно 20 мм).", True, "MARGIN_T"
+    If Not m.TopOk And Not hasLetterhead Then AddIssue issues, cnt, "Верхнее поле " & Format$(T, "0.0") & " мм (нужно 20 мм).", True, "MARGIN_T"
     If Not m.BottomOk Then AddIssue issues, cnt, "Нижнее поле " & Format$(B, "0.0") & " мм (нужно 20 мм).", True, "MARGIN_B"
     If Not m.RightOk Then AddIssue issues, cnt, "Правое поле " & Format$(R, "0.0") & " мм (нужно 10 мм).", True, "MARGIN_R"
 End Sub
+
+' Документ начинается с таблицы (бланк с гербом)? Тогда верхнее поле
+' интенционально уменьшено и проверяться не должно.
+Private Function HasLetterhead(doc As Document) As Boolean
+    HasLetterhead = False
+    If doc.Tables.Count = 0 Then Exit Function
+    Dim firstTable As Table
+    Set firstTable = doc.Tables(1)
+    ' Найти первый непустой параграф документа и сравнить с первым параграфом таблицы.
+    Dim firstNonEmpty As Paragraph
+    Dim p As Paragraph
+    For Each p In doc.Paragraphs
+        If Len(Trim$(p.Range.Text)) > 0 Then
+            Set firstNonEmpty = p
+            Exit For
+        End If
+    Next p
+    If firstNonEmpty Is Nothing Then Exit Function
+    ' Если первый непустой параграф находится внутри первой таблицы — это бланк
+    On Error Resume Next
+    If firstNonEmpty.Range.Information(wdWithInTable) Then
+        Dim tbl As Table
+        Set tbl = firstNonEmpty.Range.Tables(1)
+        If Not tbl Is Nothing Then
+            If tbl.Range.Start = firstTable.Range.Start Then HasLetterhead = True
+        End If
+    End If
+    On Error GoTo 0
+End Function
 
 Private Sub GatherFontStyling(doc As Document, issues() As Issue, ByRef cnt As Long, ByRef fs As FontState)
     Dim para As Paragraph

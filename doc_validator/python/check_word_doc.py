@@ -128,15 +128,40 @@ def _in_right_block(p: Paragraph) -> bool:
 
 
 # ---------- проверки ----------
+def _has_letterhead(doc) -> bool:
+    """True, если документ начинается с таблицы (типичная разметка бланка с
+    гербом / реквизитами организации). В таких документах верхнее поле обычно
+    уменьшено, чтобы герб уместился — это нормально и проверяться не должно."""
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            text = "".join((t.text or "") for t in child.iter(qn("w:t"))).strip()
+            if text:
+                return False
+            # пустой параграф в начале — пропускаем
+            continue
+        if child.tag == qn("w:tbl"):
+            return True
+        if child.tag == qn("w:sectPr"):
+            continue
+        # любой иной первый значимый элемент — это уже не бланк
+        break
+    return False
+
+
 def collect_issues(doc) -> List[Issue]:
     issues: List[Issue] = []
     s = doc.sections[0]
+    has_letterhead = _has_letterhead(doc)
     for name, actual, required, code in (
         ("Левое",   emu_to_mm(s.left_margin),   MARGIN_LEFT_MM,   "MARGIN_L"),
         ("Верхнее", emu_to_mm(s.top_margin),    MARGIN_TOP_MM,    "MARGIN_T"),
         ("Нижнее",  emu_to_mm(s.bottom_margin), MARGIN_BOTTOM_MM, "MARGIN_B"),
         ("Правое",  emu_to_mm(s.right_margin),  MARGIN_RIGHT_MM,  "MARGIN_R"),
     ):
+        if code == "MARGIN_T" and has_letterhead:
+            # Бланк с гербом «съедает» верхнее поле — это интенционально.
+            continue
         if abs(actual - required) > MM_TOL:
             issues.append(Issue(code, f"{name} поле {actual} мм (нужно {required} мм).", True))
 

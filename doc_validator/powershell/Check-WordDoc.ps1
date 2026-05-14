@@ -64,6 +64,25 @@ function Show-OpenDialog {
     $dlg.FileName
 }
 
+function Has-Letterhead($doc) {
+    # Документ начинается с таблицы (бланк с гербом)? Тогда верхнее поле
+    # интенционально уменьшено и проверяться не должно.
+    if ($doc.Tables.Count -eq 0) { return $false }
+    $firstTable = $doc.Tables.Item(1)
+    foreach ($p in $doc.Paragraphs) {
+        if ($p.Range.Text.Trim().Length -eq 0) { continue }
+        # первый непустой параграф
+        try {
+            if ($p.Range.Information(12)) { # wdWithInTable
+                $tbl = $p.Range.Tables.Item(1)
+                if ($tbl.Range.Start -eq $firstTable.Range.Start) { return $true }
+            }
+        } catch { }
+        return $false
+    }
+    return $false
+}
+
 function Collect-Issues($doc) {
     $issues = New-Object System.Collections.Generic.List[object]
     $ps = $doc.PageSetup
@@ -72,8 +91,10 @@ function Collect-Issues($doc) {
     $bottomMM = PointsToMillimeters $ps.BottomMargin
     $rightMM  = PointsToMillimeters $ps.RightMargin
 
+    $hasLetterhead = Has-Letterhead $doc
+
     if ([Math]::Abs($leftMM   - $MARGIN_LEFT_MM)   -gt $MM_TOL) { $issues.Add(@{ Code='MARGIN_L'; Fixable=$true; Text="Левое поле $leftMM мм (нужно 30 мм)." }) }
-    if ([Math]::Abs($topMM    - $MARGIN_TOP_MM)    -gt $MM_TOL) { $issues.Add(@{ Code='MARGIN_T'; Fixable=$true; Text="Верхнее поле $topMM мм (нужно 20 мм)." }) }
+    if ((-not $hasLetterhead) -and ([Math]::Abs($topMM - $MARGIN_TOP_MM) -gt $MM_TOL)) { $issues.Add(@{ Code='MARGIN_T'; Fixable=$true; Text="Верхнее поле $topMM мм (нужно 20 мм)." }) }
     if ([Math]::Abs($bottomMM - $MARGIN_BOTTOM_MM) -gt $MM_TOL) { $issues.Add(@{ Code='MARGIN_B'; Fixable=$true; Text="Нижнее поле $bottomMM мм (нужно 20 мм)." }) }
     if ([Math]::Abs($rightMM  - $MARGIN_RIGHT_MM)  -gt $MM_TOL) { $issues.Add(@{ Code='MARGIN_R'; Fixable=$true; Text="Правое поле $rightMM мм (нужно 10 мм)." }) }
 
